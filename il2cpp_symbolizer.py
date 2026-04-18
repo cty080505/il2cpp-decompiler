@@ -11,8 +11,9 @@ import argparse
 import struct
 import os
 import sys
+import mmap
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, BinaryIO
 from enum import IntEnum
 
 
@@ -148,7 +149,7 @@ class MethodSymbol:
 
 
 class MetadataReader:
-    """global-metadata.dat 读取器"""
+    """global-metadata.dat 读取器（使用内存映射避免大文件内存问题）"""
     
     # 元数据头魔术数字
     METADATA_MAGIC = 0xFAB11BAF
@@ -156,6 +157,8 @@ class MetadataReader:
     def __init__(self, filepath: str):
         self.filepath = filepath
         self.data: bytes = b''
+        self.mmapped_file = None
+        self.mmapped_data = None
         self.header: dict = {}
         self.strings: Dict[int, str] = {}
         self.types: List[Il2CppTypeDefinition] = []
@@ -163,19 +166,35 @@ class MetadataReader:
         self.parameters: List[Il2CppParameterDefinition] = []
         
     def read(self) -> bool:
-        """读取元数据文件"""
+        """读取元数据文件（使用内存映射）"""
         try:
-            with open(self.filepath, 'rb') as f:
-                self.data = f.read()
+            file_size = os.path.getsize(self.filepath)
+            
+            # 对于小文件（< 100MB），直接读取到内存
+            if file_size < 100 * 1024 * 1024:
+                with open(self.filepath, 'rb') as f:
+                    self.data = f.read()
+            else:
+                # 对于大文件，使用内存映射
+                self.mmapped_file = open(self.filepath, 'rb')
+                self.mmapped_data = mmap.mmap(self.mmapped_file.fileno(), 0, access=mmap.ACCESS_READ)
+                self.data = self.mmapped_data
             
             if len(self.data) < 64:
-                print(f"错误: 文件太小，不是有效的元数据文件")
+                print(f"错误：文件太小，不是有效的元数据文件")
                 return False
                 
             return self._parse_header()
         except Exception as e:
-            print(f"错误: 无法读取文件 - {e}")
+            print(f"错误：无法读取文件 - {e}")
             return False
+    
+    def close(self):
+        """关闭文件和内存映射"""
+        if self.mmapped_data is not None:
+            self.mmapped_data.close()
+        if self.mmapped_file is not None:
+            self.mmapped_file.close()
     
     def _parse_header(self) -> bool:
         """解析元数据头"""
@@ -505,9 +524,8 @@ class IL2CPPSymbolizer:
         
         return f"{return_type} ({', '.join(params)})"
     
-    def symbolize_methods(self) -> List[MethodSymbol]:
-        """符号化所有方法"""
-        symbols = []
+    def symbolize_methods_generator(self):
+        """符号化所有方法（生成器版本，流式处理避免内存溢出）"""
         
         for method in self.metadata_reader.methods:
             # 获取方法所属的类型
@@ -537,33 +555,67 @@ class IL2CPPSymbolizer:
                 signature=method.signature,
                 full_name=method.full_name
             )
-            symbols.append(symbol)
-        
-        return symbols
+            yield symbol
     
-    def generate_symbol_file(self, output_path: str, symbols: List[MethodSymbol]) -> bool:
-        """生成符号文件"""
+    def symbolize_methods(self) -> List[MethodSymbol]:
+        """符号化所有方法（返回列表版本，兼容旧代码但可能消耗较多内存）"""
+        return list(self.symbolize_methods_generator())
+    
+    def generate_symbol_file(self, output_path: str, symbols=None) -> bool:
+        """生成符号文件（支持流式写入）"""
         try:
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write("# IL2CPP Symbol File\n")
                 f.write("# Format: Address Size Name Signature FullName\n")
                 f.write("#\n")
                 
-                sorted_symbols = sorted(symbols, key=lambda s: s.address if s.address > 0 else float('inf'))
-                
-                for sym in sorted_symbols:
-                    if sym.address > 0:
-                        f.write(f"0x{sym.address:016X} {sym.size:8d} {sym.full_name} \"{sym.signature}\"\n")
-            
-            print(f"符号文件已生成: {output_path}")
-            print(f"共写入 {len(symbols)} 个符号")
+                # 如果是生成器，则流式处理；如果是列表，则排序后写入
+                if hasattr(symbols, '__iter__') and not isinstance(symbols, list):
+                    # 流式处理生成器
+                    count = 0
+                    for sym in symbols:
+                        if sym.address > 0:
+                            f.write(f"0x{sym.address:016X} {sym.size:8d} {sym.full_name} \"{sym.signature}\"\n")
+                            count += 1
+                    print(f"符号文件已生成：{output_path}")
+                    print(f"共写入 {count} 个符号")
+                else:
+                    # 列表模式，可以排序
+                    sorted_symbols = sorted(symbols, key=lambda s: s.address if s.address > 0 else float('inf'))
+                    
+                    for sym in sorted_symbols:
+                        if sym.address > 0:
+                            f.write(f"0x{sym.address:016X} {sym.size:8d} {sym.full_name} \"{sym.signature}\"\n")
+                    
+                    print(f"符号文件已生成：{output_path}")
+                    print(f"共写入 {len(symbols)} 个符号")
             return True
         except Exception as e:
-            print(f"错误: 无法生成符号文件 - {e}")
+            print(f"错误：无法生成符号文件 - {e}")
             return False
     
-    def generate_ida_script(self, output_path: str, symbols: List[MethodSymbol]) -> bool:
-        """生成 IDA Python 脚本"""
+    def generate_symbol_file_streaming(self, output_path: str) -> bool:
+        """生成符号文件（流式版本，边生成边保存，避免内存溢出）"""
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write("# IL2CPP Symbol File\n")
+                f.write("# Format: Address Size Name Signature FullName\n")
+                f.write("#\n")
+                
+                count = 0
+                for sym in self.symbolize_methods_generator():
+                    if sym.address > 0:
+                        f.write(f"0x{sym.address:016X} {sym.size:8d} {sym.full_name} \"{sym.signature}\"\n")
+                        count += 1
+                
+                print(f"符号文件已生成：{output_path}")
+                print(f"共写入 {count} 个符号")
+            return True
+        except Exception as e:
+            print(f"错误：无法生成符号文件 - {e}")
+            return False
+    def generate_ida_script(self, output_path: str, symbols=None) -> bool:
+        """生成 IDA Python 脚本（支持流式写入）"""
         try:
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write("# IDA Python Script for IL2CPP Symbolization\n")
@@ -575,7 +627,9 @@ class IL2CPPSymbolizer:
                 f.write("def apply_symbols():\n")
                 f.write("    symbols = [\n")
                 
-                for sym in symbols:
+                # 如果是生成器，则流式处理；如果是列表，则直接迭代
+                symbol_iter = symbols if symbols is not None else self.symbolize_methods_generator()
+                for sym in symbol_iter:
                     if sym.address > 0:
                         f.write(f"        (0x{sym.address:X}, \"{sym.full_name}\"),\n")
                 
@@ -595,8 +649,8 @@ class IL2CPPSymbolizer:
             print(f"错误: 无法生成 IDA 脚本 - {e}")
             return False
     
-    def generate_ghidra_script(self, output_path: str, symbols: List[MethodSymbol]) -> bool:
-        """生成 Ghidra 脚本"""
+    def generate_ghidra_script(self, output_path: str, symbols=None) -> bool:
+        """生成 Ghidra 脚本（支持流式写入）"""
         try:
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write("// Ghidra Script for IL2CPP Symbolization\n")
@@ -609,7 +663,9 @@ class IL2CPPSymbolizer:
                 f.write("def apply_symbols():\n")
                 f.write("    symbols = [\n")
                 
-                for sym in symbols:
+                # 如果是生成器，则流式处理；如果是列表，则直接迭代
+                symbol_iter = symbols if symbols is not None else self.symbolize_methods_generator()
+                for sym in symbol_iter:
                     if sym.address > 0:
                         f.write(f"        (0x{sym.address:X}, \"{sym.full_name}\"),\n")
                 
@@ -679,6 +735,7 @@ def main():
     parser.add_argument('-d', '--dll', help='GameAssembly.dll 文件路径（可选）')
     parser.add_argument('-s', '--symbols', help='符号文件路径（.sym/.map 格式）')
     parser.add_argument('-o', '--output', help='输出符号文件路径')
+    parser.add_argument('--streaming', action='store_true', help='使用流式模式生成符号文件（避免内存溢出）')
     parser.add_argument('--ida', help='生成 IDA Python 脚本')
     parser.add_argument('--ghidra', help='生成 Ghidra 脚本')
     parser.add_argument('--dump', help='导出方法列表到文件')
@@ -710,13 +767,20 @@ def main():
     
     # 符号化方法
     print("\n符号化处理中...")
-    symbols = symbolizer.symbolize_methods()
     
     # 输出结果
     if args.output:
-        print(f"\n生成符号文件: {args.output}")
-        symbolizer.generate_symbol_file(args.output, symbols)
-    
+        print(f"\n生成符号文件：{args.output}")
+        if args.streaming:
+            # 流式模式，避免内存溢出
+            symbolizer.generate_symbol_file_streaming(args.output)
+        else:
+            # 传统模式，加载所有符号到内存
+            symbols = symbolizer.symbolize_methods()
+            symbolizer.generate_symbol_file(args.output, symbols)
+    else:
+        # 如果没有输出文件，但仍需要符号列表（用于 IDA/Ghidra 脚本）
+        symbols = symbolizer.symbolize_methods()
     if args.ida:
         print(f"\n生成 IDA 脚本: {args.ida}")
         symbolizer.generate_ida_script(args.ida, symbols)
@@ -743,6 +807,8 @@ def main():
                 addr_str = f"0x{sym.address:X}" if sym.address > 0 else "N/A"
                 print(f"  [{i}] {sym.full_name} @ {addr_str}")
     
+    # 关闭资源
+    symbolizer.metadata_reader.close()
     print("\n" + "=" * 60)
     print("完成!")
     print("=" * 60)
