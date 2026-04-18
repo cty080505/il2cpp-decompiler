@@ -711,6 +711,44 @@ class IL2CPPSymbolizer:
             return False
 
 
+
+    def dump_methods_streaming(self, output_path: str) -> bool:
+        """导出方法列表（流式版本）"""
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write("# IL2CPP Methods\n")
+                f.write("# Format: Token Address Size FullName Signature\n")
+                f.write("#\n")
+
+                for method in self.metadata_reader.methods:
+                    # 获取方法所属的类型
+                    type_index = method.declaring_type
+                    type_name = ""
+                    if 0 <= type_index < len(self.metadata_reader.types):
+                        type_name = self.metadata_reader.types[type_index].full_name
+                    
+                    full_name = f"{type_name}::{method.name}" if type_name else method.name
+                    signature = self._build_method_signature(method)
+                    
+                    # 获取地址信息
+                    address = 0
+                    size = 0
+                    if method.token in self.method_addresses:
+                        address, size = self.method_addresses[method.token]
+                    elif self.symbol_parser and method.name in self.symbol_parser.symbols:
+                        sym = self.symbol_parser.symbols[method.name]
+                        address = sym.address
+                        size = sym.size
+
+                    token = method.token
+                    f.write(f"0x{token:08X} 0x{address:016X} {size:8d} {full_name} \"{signature}\"\n")
+
+            print(f"方法列表已导出：{output_path}")
+            return True
+        except Exception as e:
+            print(f"错误：无法导出方法列表 - {e}")
+            return False
+
 def main():
     parser = argparse.ArgumentParser(
         description='IL2CPP Symbolizer - 利用 global-metadata.dat 对 GameAssembly.dll 进行符号化',
@@ -767,32 +805,48 @@ def main():
     
     # 符号化方法
     print("\n符号化处理中...")
-    
+
     # 输出结果
     if args.output:
         print(f"\n生成符号文件：{args.output}")
         if args.streaming:
             # 流式模式，避免内存溢出
             symbolizer.generate_symbol_file_streaming(args.output)
+            symbols = None
         else:
             # 传统模式，加载所有符号到内存
             symbols = symbolizer.symbolize_methods()
             symbolizer.generate_symbol_file(args.output, symbols)
     else:
         # 如果没有输出文件，但仍需要符号列表（用于 IDA/Ghidra 脚本）
-        symbols = symbolizer.symbolize_methods()
+        if args.streaming:
+            symbols = None  # 流式模式下不保留列表
+        else:
+            symbols = symbolizer.symbolize_methods()
+    
     if args.ida:
-        print(f"\n生成 IDA 脚本: {args.ida}")
-        symbolizer.generate_ida_script(args.ida, symbols)
-    
+        print(f"\n生成 IDA 脚本：{args.ida}")
+        if args.streaming:
+            # 流式模式：直接传递生成器
+            symbolizer.generate_ida_script(args.ida, symbolizer.symbolize_methods_generator())
+        else:
+            symbolizer.generate_ida_script(args.ida, symbols)
+
     if args.ghidra:
-        print(f"\n生成 Ghidra 脚本: {args.ghidra}")
-        symbolizer.generate_ghidra_script(args.ghidra, symbols)
-    
+        print(f"\n生成 Ghidra 脚本：{args.ghidra}")
+        if args.streaming:
+            # 流式模式：直接传递生成器
+            symbolizer.generate_ghidra_script(args.ghidra, symbolizer.symbolize_methods_generator())
+        else:
+            symbolizer.generate_ghidra_script(args.ghidra, symbols)
+
     if args.dump:
-        print(f"\n导出方法列表: {args.dump}")
-        symbolizer.dump_methods(args.dump, symbols)
-    
+        print(f"\n导出方法列表：{args.dump}")
+        if args.streaming:
+            # 流式模式：重新生成一次用于 dump
+            symbolizer.dump_methods_streaming(args.dump)
+        else:
+            symbolizer.dump_methods(args.dump, symbols)
     # 如果没有指定输出，显示统计信息
     if not any([args.output, args.ida, args.ghidra, args.dump]):
         print(f"\n统计信息:")
